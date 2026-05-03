@@ -1,0 +1,112 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitive Helpers
+    function isSignedIn() { return request.auth != null; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // Role based checks
+    function isOwner(authorId) { return isSignedIn() && request.auth.uid == authorId; }
+    
+    // IMPORTANT: Check exists() before get().data to prevent rule evaluation crashes
+    function getUserRole() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) 
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role 
+        : "user";
+    }
+    function isAdmin() { return isSignedIn() && (getUserRole() == "admin" || isAdminEmail()); }
+    function isModerator() { return isSignedIn() && (getUserRole() == "moderator" || getUserRole() == "admin" || isAdminEmail()); }
+    function isAdminEmail() { 
+      return 'email' in request.auth.token && request.auth.token.email != null && request.auth.token.email.toLowerCase() == 'funtasticgamer101@gmail.com'; 
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if true;
+      allow create: if isValidId(userId) && isSignedIn() && request.auth.uid == userId
+                    && (!('role' in incoming()) || incoming().role == 'user' || isAdminEmail());
+      allow update: if isValidId(userId) && isSignedIn() && (
+                      (request.auth.uid == userId && (!('role' in incoming()) || incoming().role == existing().role)) || 
+                      isAdmin()
+                    );
+    }
+
+    // Reports Collection
+    match /reports/{reportId} {
+      // Prioritize static user checks before evaluating resource data to satisfy list queries
+      allow get: if isValidId(reportId) && (isModerator() || isOwner(existing().authorId) || existing().status in ['approved', 'starred']);
+      allow list: if isModerator() || isOwner(existing().authorId) || existing().status in ['approved', 'starred'];
+      
+      allow create: if isValidId(reportId) && isSignedIn() 
+                    && incoming().authorId == request.auth.uid
+                    && incoming().status == 'pending'
+                    && incoming().keys().hasAll(['category', 'title', 'content', 'authorId', 'status', 'allowComments', 'createdAt', 'upvoteCount', 'downvoteCount', 'threatScore']);
+                    
+      allow update: if isValidId(reportId) && isSignedIn() && (
+                      (isOwner(existing().authorId) && existing().status == 'pending') ||
+                      isModerator() || 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['upvoteCount', 'downvoteCount'])
+                    );
+                    
+      allow delete: if isValidId(reportId) && (isOwner(existing().authorId) || isModerator());
+
+      // Votes subcollection
+      match /votes/{userId} {
+        allow get: if isValidId(reportId) && isValidId(userId);
+        allow list: if isValidId(reportId);
+        allow create, update: if isSignedIn() && request.auth.uid == userId
+                              && incoming().keys().hasAll(['value'])
+                              && (incoming().value == 1 || incoming().value == -1);
+        allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+      
+      // Comments subcollection
+      match /comments/{commentId} {
+        allow get: if isValidId(reportId) && isValidId(commentId);
+        allow list: if isValidId(reportId);
+        function parentAllowsComments() {
+          return exists(/databases/$(database)/documents/reports/$(reportId)) && get(/databases/$(database)/documents/reports/$(reportId)).data.allowComments == true;
+        }
+        allow create: if isValidId(reportId) && isValidId(commentId) && isSignedIn() 
+                      && incoming().authorId == request.auth.uid
+                      && parentAllowsComments()
+                      && incoming().keys().hasAll(['authorId', 'content', 'createdAt'])
+                      && incoming().content.size() > 0 && incoming().content.size() <= 2000;
+        allow update: if isValidId(reportId) && isValidId(commentId) && isSignedIn() 
+                      && isOwner(existing().authorId)
+                      && incoming().diff(existing()).affectedKeys().hasOnly(['content', 'updatedAt'])
+                      && incoming().content.size() > 0 && incoming().content.size() <= 2000;
+        allow delete: if isValidId(reportId) && isValidId(commentId) && (isOwner(existing().authorId) || isModerator());
+      }
+    }
+
+    // Flags Collection
+    match /flags/{flagId} {
+      allow get: if isValidId(flagId) && isModerator();
+      allow list: if isModerator();
+      allow create: if isValidId(flagId) && isSignedIn()
+                    && incoming().reporterId == request.auth.uid
+                    && incoming().status == 'pending'
+                    && incoming().keys().hasAll(['targetId', 'targetPath', 'reporterId', 'reason', 'status', 'createdAt']);
+      allow update: if isValidId(flagId) && isModerator()
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']);
+    }
+    // Scammers Collection
+    match /scammers/{scammerId} {
+       // Anyone can see but only admins can create, edit, update, delete.
+       allow get: if isValidId(scammerId);
+       allow list: if true;
+       allow create, update, delete: if isValidId(scammerId) && isAdmin();
+    }
+  }
+}
